@@ -194,7 +194,6 @@ class RubiksCube:
             # Do not allow the inverse action of the previous action
             if previous_action is not None:
                 inverse_action = inverse_actions[previous_action]
-                print(previous_action, inverse_action)
                 possible_actions.remove(inverse_action)
 
             action = int(rng.choice(possible_actions))

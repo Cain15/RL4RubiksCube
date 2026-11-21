@@ -77,17 +77,17 @@ def test_sune_has_order_six():
 def test_u_clockwise_geometry():
     # U clockwise: F top row -> L, L -> B, B -> R, R -> F. Colours: U0 R1 F2 D3 L4 B5
     s = RubiksCube().step(IDX["U"]).state
-    assert np.all(s[36:39] == 2)   # L top row now has F's colour
-    assert np.all(s[45:48] == 4)   # B top row now has L's colour
-    assert np.all(s[9:12] == 5)    # R top row now has B's colour
-    assert np.all(s[18:21] == 1)   # F top row now has R's colour
-    assert np.all(s[0:9] == 0)     # U face colour unchanged (uniform)
+    assert np.all(s[36:39] == 2)  # L top row now has F's colour
+    assert np.all(s[45:48] == 4)  # B top row now has L's colour
+    assert np.all(s[9:12] == 5)  # R top row now has B's colour
+    assert np.all(s[18:21] == 1)  # F top row now has R's colour
+    assert np.all(s[0:9] == 0)  # U face colour unchanged (uniform)
 
 
 def test_r_clockwise_geometry():
     # R clockwise: F right col -> U, U -> B (reversed), B -> D, D -> F
     s = RubiksCube().step(IDX["R"]).state
-    assert np.all(s[[2, 5, 8]] == 2)     # U right col gets F's colour
+    assert np.all(s[[2, 5, 8]] == 2)  # U right col gets F's colour
     assert np.all(s[[45 + 6, 45 + 3, 45 + 0]] == 0)  # B gets U's colour on its (mirrored) left col
     assert np.all(s[[27 + 2, 27 + 5, 27 + 8]] == 5)  # D right col gets B's colour
     assert np.all(s[[18 + 2, 18 + 5, 18 + 8]] == 3)  # F right col gets D's colour

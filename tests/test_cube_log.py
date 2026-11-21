@@ -1,8 +1,8 @@
 """Run with: pytest"""
 import numpy as np
 
-from src.RubiksCube import RubiksCube
 from src.CubeLog import MoveLogger, read_log
+from src.RubiksCube import RubiksCube
 
 
 def test_logger_roundtrip(tmp_path):
@@ -50,7 +50,7 @@ def test_lines_are_flushed_immediately(tmp_path):
     log = MoveLogger(p)
     log.reset([])
     log.step(3)
-    assert len(p.read_text().splitlines()) == 2   # readable before close()
+    assert len(p.read_text().splitlines()) == 2  # readable before close()
     log.close()
 
 
