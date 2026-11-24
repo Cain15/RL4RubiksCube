@@ -106,8 +106,9 @@ def _build_perm(face):
 
 _cw = np.stack([_build_perm(face) for face in faces])  # Clockwise moves
 _ccw = np.argsort(_cw, axis=1)  # Counterclockwise moves
-perms = np.concatenate([_cw, _ccw])  # All 12 possible quarter moves
-action_names = list(faces) + [f + "'" for f in faces]
+_half = np.stack([p[p] for p in _cw]) # Half turns: apply each clockwise quarter turn twice
+perms = np.concatenate([_cw, _ccw, _half])  # All 18 possible moves
+action_names = list(faces) + [f + "'" for f in faces] + [f + "2" for f in faces]
 solved = np.repeat(np.arange(6), 9).astype(np.int8)  # Solved state
 
 
@@ -189,7 +190,7 @@ class RubiksCube:
         inverse_actions = get_inverse_actions()
 
         for _ in range(n):
-            possible_actions = list(range(12))
+            possible_actions = list(range(18))
 
             # Do not allow the inverse action of the previous action
             if previous_action is not None:

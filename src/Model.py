@@ -4,13 +4,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.CubeLog import MoveLogger
 from src.Env import *
+from src.RubiksCube import solved
 
 BIG = 1000
 
 solved_state = np.asarray(RubiksCube().one_hot())
 
-torch.set_num_threads(4)
+torch.set_num_threads(8)
 
 
 class ResBlock(nn.Module):
@@ -46,7 +48,7 @@ class QNet(nn.Module):
             ResBlock(256),
         )
 
-        self.out = nn.Linear(256, 12)
+        self.out = nn.Linear(256, 18)
 
     def forward(self, x):
         x = self.input(x)
@@ -197,7 +199,7 @@ def rollout(net, buf, n_env, K, T, eps):
         # Epsilon-greedy exploration
         random_mask = rng.random(len(active)) < eps
         random_actions = rng.integers(
-            0, 12, size=len(active)
+            0, 18, size=len(active)
         )
 
         actions = np.where(
@@ -229,13 +231,13 @@ def rollout(net, buf, n_env, K, T, eps):
             cubes[idx] = next_cube
 
 
-def train(iterations=100_000, K=26, warmup=500, target_every=250, n_demo=128,
+def train(iterations=100_000, K=26, warmup=500, target_every=250, n_demo=256,
           n_env=256, T=8, eps=0.2, path="qnet.pt", log_every=200):
     """
     Train the Q-network to estimate the remaining number of moves.
     """
     lr = 1e-4
-    batch_size = 1024
+    batch_size = 2048
 
     net, tgt = QNet(), QNet()
     tgt.load_state_dict(net.state_dict())
@@ -325,7 +327,7 @@ def train(iterations=100_000, K=26, warmup=500, target_every=250, n_demo=128,
     return net
 
 
-def report(net, n=500, depths=(1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 25)):
+def report(net, n=500, depths=(1, 2, 4, 6, 8, 10, 12, 14, 16, 20)):
     net.eval()
 
     results = []
@@ -346,30 +348,65 @@ def report(net, n=500, depths=(1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 25)):
     print(" | ".join(results), flush=True)
 
 
-from RubiksCube import solved
-
-
 def is_solved(state):
     return np.array_equal(state, solved)
 
 
 import heapq
+from RubiksCube import perms, solved
+
+opposite = {
+    0: 3,  # U -> D
+    1: 4,  # R -> L
+    2: 5   # F -> B
+}
+
+one_hot_table = np.eye(6, dtype=np.float32)
+
+allowed_actions = {
+    last_face: [
+        action for action in range(18)
+        if last_face == -1 or (
+            action % 6 != last_face
+            and opposite.get(action % 6) != last_face
+        )
+    ]
+    for last_face in range(-1, 6)
+}
 
 
 @torch.no_grad()
 def beam_search(net, cube, beam_width=1 << 14,
                 max_depth=40, score_children=False):
-    """
-    Beam search using the trained network as a heuristic.
-    """
 
     net.eval()
 
     if cube.is_solved():
         return [], 0
 
-    # Node: (state, path, last_action)
-    beam = [(cube.state.copy(), [], -1)]
+    # Parent records: only store parent ID and action
+    max_nodes = max_depth * beam_width + 1
+
+    parent_ids = np.empty(max_nodes, dtype=np.int32)
+    parent_actions = np.empty(max_nodes, dtype=np.int8)
+
+    # Root node
+    parent_ids[0] = -1
+    parent_actions[0] = -1
+
+    next_id = 1
+
+    def reconstruct_path(node_id):
+        path = []
+
+        while node_id != 0:
+            path.append(int(parent_actions[node_id]))
+            node_id = int(parent_ids[node_id])
+
+        return path[::-1]
+
+    # Node: (state, node_id, last_face)
+    beam = [(cube.state.copy(), 0, -1)]
 
     for depth in range(max_depth):
 
@@ -377,78 +414,112 @@ def beam_search(net, cube, beam_width=1 << 14,
 
         # Batch inference for all parents
         if not score_children:
-            parent_states = np.asarray([
-                RubiksCube(state).one_hot()
-                for state, _, _ in beam
+            states = np.stack([
+                state for state, _, _ in beam
             ])
+
+            parent_states = one_hot_table[states].reshape(
+                len(beam), 324
+            )
 
             parent_q = q_values(net, parent_states).cpu().numpy()
 
-        for i, (state, path, last_action) in enumerate(beam):
+        for i, (state, node_id, last_face) in enumerate(beam):
 
-            parent = RubiksCube(state)
+            for action in allowed_actions[last_face]:
+                face = action % 6
 
-            for action in range(12):
+                # Generate child state directly
+                child_state = state[perms[action]]
 
-                if last_action != -1 and action == (last_action + 6) % 12:
-                    continue
+                if np.array_equal(child_state, solved):
+                    return reconstruct_path(node_id) + [action], depth + 1
 
-                child = parent.step(action)
-                child_state = child.state.copy()
-
-                if child.is_solved():
-                    return path + [action], depth + 1
-
-                key = child_state.tobytes()
+                key = (child_state.tobytes(), face)
 
                 if score_children:
-                    score = heuristic(net, child.one_hot())
+                    child_one_hot = one_hot_table[child_state].ravel()
+                    score = heuristic(net, child_one_hot)
                 else:
                     score = float(parent_q[i, action])
 
                 old = candidates.get(key)
 
-                if old is None or score < old[2]:
+                if old is None or score < old[1]:
                     candidates[key] = (
                         child_state,
-                        path + [action],
                         score,
-                        action
+                        node_id,
+                        action,
+                        face
                     )
 
         if not candidates:
             break
 
-        # Only keep best states
-        beam = [
-            (state, path, action)
-            for state, path, score, action
-            in heapq.nsmallest(
-                beam_width,
-                candidates.values(),
-                key=lambda x: x[2]
-            )
-        ]
+        # Select the best candidates
+        selected = heapq.nsmallest(
+            beam_width,
+            candidates.values(),
+            key=lambda x: x[1]
+        )
+
+        new_beam = []
+
+        for state, score, parent_id, action, face in selected:
+
+            node_id = next_id
+            next_id += 1
+
+            parent_ids[node_id] = parent_id
+            parent_actions[node_id] = action
+
+            new_beam.append((state, node_id, face))
+
+        beam = new_beam
 
     return None
 
 
-from CubeLog import MoveLogger
-
 if __name__ == "__main__":
     # train()
-    net = load_net()
-    cube, scramble = RubiksCube().scramble(30, rng)
+    net = load_net("qnet_best.pt")
+    report(net)
 
-    result = beam_search(net, cube)
+    t0 = time.time()
+    lengths = []
+    logger = MoveLogger("solution.jsonl", False)
+    n = 1000
+    benchmark_rng = np.random.default_rng(42)
 
-    if result:
-        solution, length = result
-        print("Found solution of length:", length)
-        logger = MoveLogger("solution.jsonl")
-        logger.reset(scramble)
-        for a in solution:
-            cube = cube.step(a)
-            logger.step(a)
-        print("cube solved:", cube.is_solved())
-        logger.close()
+    scrambles = [
+        RubiksCube().scramble(100, benchmark_rng)
+        for _ in range(n)
+    ]
+    for cube, scramble in scrambles:
+        result = beam_search(net, cube, beam_width=1 << 16)
+        if result:
+            solution, length = result
+            print("Found solution of length:", length)
+            logger.reset(scramble)
+            for a in solution:
+                cube = cube.step(a)
+                logger.step(a)
+            print("cube solved:", cube.is_solved())
+            lengths.append(length)
+    logger.close()
+    elapsed = time.time() - t0
+    avg_length = sum(lengths) / len(lengths) if lengths else 0
+    success = len(lengths)
+    stats = (
+        f"Time: {elapsed:.2f}s | "
+        f"Average length: {avg_length:.2f} | "
+        f"Success: {success}/{n} "
+        f"({success / n * 100:.1f}%)\n"
+    )
+
+    print(stats)
+
+    with open("benchmark_results.txt", "a", encoding="utf-8") as f:
+        f.write(stats)
+

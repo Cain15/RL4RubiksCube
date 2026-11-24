@@ -2,14 +2,14 @@
 import numpy as np
 import pytest
 
-from src.RubiksCube import RubiksCube, perms, solved, action_names
+from src.RubiksCube import RubiksCube, perms, solved, action_names, get_inverse_actions
 
 CENTERS = [4, 13, 22, 31, 40, 49]
 IDX = {n: i for i, n in enumerate(action_names)}
 
-
+inverse_actions = get_inverse_actions()
 def inverse(a):
-    return (a + 6) % 12
+    return inverse_actions[a]
 
 
 def apply(RubiksCube, actions):
@@ -25,7 +25,7 @@ def test_solved_state_layout():
 
 
 def test_perms_shape_and_validity():
-    assert perms.shape == (12, 54)
+    assert perms.shape == (18, 54)
     for p in perms:
         assert sorted(p) == list(range(54))  # each is a true permutation
 

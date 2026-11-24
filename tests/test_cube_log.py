@@ -56,8 +56,8 @@ def test_lines_are_flushed_immediately(tmp_path):
 
 def test_replaying_log_reproduces_env_state(tmp_path):
     rng = np.random.default_rng(0)
-    scramble = rng.integers(0, 12, 10)
-    actions = rng.integers(0, 12, 25)
+    scramble = rng.integers(0, 18, 10)
+    actions = rng.integers(0, 18, 25)
     p = tmp_path / "r.jsonl"
     with MoveLogger(p) as log:
         log.reset(scramble)

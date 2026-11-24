@@ -60,7 +60,11 @@ const EMBEDDED_LOG = /*__EMBEDDED_LOG__*/ null;
 
 // ==== CORE (depends only on THREE; also tested headlessly against the Python Cube) ====
 const FACES = "URFDLB";
-const ACTION_NAMES = [...FACES].concat([...FACES].map(f => f + "'"));
+const ACTION_NAMES = [
+  ...FACES,
+  ...[...FACES].map(f => f + "'"),
+  ...[...FACES].map(f => f + "2")
+];
 const NORMALS = { U:[0,1,0], R:[1,0,0], F:[0,0,1], D:[0,-1,0], L:[-1,0,0], B:[0,0,-1] };
 const COLORS = [0xffffff, 0xd32f2f, 0x2e7d32, 0xfbc02d, 0xf57c00, 0x1565c0]; // U R F D L B
 
@@ -105,7 +109,17 @@ function resetCube(cubies) {                                  // back to the sol
 function moveSpec(action) {
   const n = NORMALS[FACES[action % 6]];
   const axis = new THREE.Vector3(...n);
-  const angle = (action < 6 ? -1 : 1) * Math.PI / 2;           // cw = -90, ccw = +90
+
+  let angle;
+
+  if (action < 6) {
+    angle = -Math.PI / 2;       // clockwise
+  } else if (action < 12) {
+    angle = Math.PI / 2;        // counterclockwise
+  } else {
+    angle = -Math.PI;           // half turn
+  }
+
   return { axis, angle };
 }
 
@@ -237,10 +251,14 @@ let episodes = [], ep = null, pos = 0, playing = false, token = 0, busy = false;
 
 const ease = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 const speed = () => parseFloat($("speed").value);
-const inverse = a => (a + 6) % 12;
+const inverse = a => {
+  if (a < 6) return a + 6;
+  if (a < 12) return a - 6;
+  return a;
+};
 
 function animateMove(action) {
-  const ms = 450 / speed();
+  const ms = (action >= 12 ? 800 : 450) / speed();
   const m = beginMove(cubeGroup, pivot, cubies, action);
   return new Promise(resolve => {
     const t0 = performance.now();
