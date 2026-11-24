@@ -1,12 +1,9 @@
-import time
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.CubeLog import MoveLogger
 from src.Env import *
-from src.RubiksCube import solved
 
 BIG = 1000
 
@@ -352,51 +349,147 @@ def is_solved(state):
     return np.array_equal(state, solved)
 
 
-import heapq
+import time
+import numpy as np
+
 from RubiksCube import perms, solved
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("Beam search device:", DEVICE)
+
+if DEVICE.type == "cuda":
+    print("GPU:", torch.cuda.get_device_name(DEVICE))
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+# Permutations used to generate child states
+PERMS_GPU = torch.as_tensor(
+    perms,
+    dtype=torch.long,
+    device=DEVICE
+)
+
+# One-hot lookup table
+ONE_HOT_GPU = torch.eye(
+    6,
+    dtype=torch.float32,
+    device=DEVICE
+)
+
+SOLVED_GPU = torch.as_tensor(
+    solved,
+    dtype=torch.long,
+    device=DEVICE
+)
+
+# Opposite faces
 opposite = {
-    0: 3,  # U -> D
-    1: 4,  # R -> L
-    2: 5   # F -> B
+    0: 3,
+    1: 4,
+    2: 5
 }
 
-one_hot_table = np.eye(6, dtype=np.float32)
-
+# Allowed actions for each previous face
 allowed_actions = {
     last_face: [
         action for action in range(18)
         if last_face == -1 or (
-            action % 6 != last_face
-            and opposite.get(action % 6) != last_face
+                action % 6 != last_face
+                and opposite.get(action % 6) != last_face
         )
     ]
     for last_face in range(-1, 6)
 }
 
+ALLOWED_MASK_GPU = torch.tensor(
+    [
+        [
+            action in allowed_actions[last_face]
+            for action in range(18)
+        ]
+        for last_face in range(-1, 6)
+    ],
+    dtype=torch.bool,
+    device=DEVICE
+)
+
 
 @torch.no_grad()
-def beam_search(net, cube, beam_width=1 << 14,
-                max_depth=40, score_children=False):
+def evaluate_parents(net, states):
+    """
+    Evaluate parent states.
 
+    states: (B, 54), integer cube states
+    returns: (B, 18)
+    """
+
+    states = states.long()
+
+    one_hot = ONE_HOT_GPU[states].reshape(
+        states.shape[0], 324
+    )
+
+    return net(one_hot)
+
+
+@torch.no_grad()
+def evaluate_children(net, states, batch_size=65536):
+    """
+    Evaluate child states in batches.
+
+    states: (N, 54)
+    returns: (N,) heuristic scores
+
+    Heuristic = minimum predicted Q-value.
+    """
+    states = states.long()
+
+    scores = []
+
+    for start in range(0, len(states), batch_size):
+        batch = states[start:start + batch_size]
+
+        one_hot = ONE_HOT_GPU[batch].reshape(
+            len(batch), 324
+        )
+
+        q = net(one_hot)
+
+        scores.append(q.min(dim=1).values)
+
+    return torch.cat(scores)
+
+
+@torch.no_grad()
+def beam_search(net, cube, beam_width=1 << 14, max_depth=40, score_children=False, inference_batch_size=65536):
+    """
+    use beam search to find the solved state, optimised for GPU
+    """
+    net.to(DEVICE)
     net.eval()
 
     if cube.is_solved():
         return [], 0
 
-    # Parent records: only store parent ID and action
     max_nodes = max_depth * beam_width + 1
 
-    parent_ids = np.empty(max_nodes, dtype=np.int32)
-    parent_actions = np.empty(max_nodes, dtype=np.int8)
+    parent_ids = np.empty(
+        max_nodes,
+        dtype=np.int32
+    )
 
-    # Root node
+    parent_actions = np.empty(
+        max_nodes,
+        dtype=np.int8
+    )
+
     parent_ids[0] = -1
     parent_actions[0] = -1
 
     next_id = 1
 
     def reconstruct_path(node_id):
+
         path = []
 
         while node_id != 0:
@@ -405,78 +498,218 @@ def beam_search(net, cube, beam_width=1 << 14,
 
         return path[::-1]
 
-    # Node: (state, node_id, last_face)
-    beam = [(cube.state.copy(), 0, -1)]
+    beam_states = torch.as_tensor(
+        cube.state.copy(),
+        dtype=torch.long,
+        device=DEVICE
+    ).unsqueeze(0)
+
+    beam_node_ids = np.array(
+        [0],
+        dtype=np.int32
+    )
+
+    beam_last_faces = torch.tensor(
+        [-1],
+        dtype=torch.long,
+        device=DEVICE
+    )
 
     for depth in range(max_depth):
 
-        candidates = {}
+        B = len(beam_states)
 
-        # Batch inference for all parents
-        if not score_children:
-            states = np.stack([
-                state for state, _, _ in beam
-            ])
-
-            parent_states = one_hot_table[states].reshape(
-                len(beam), 324
-            )
-
-            parent_q = q_values(net, parent_states).cpu().numpy()
-
-        for i, (state, node_id, last_face) in enumerate(beam):
-
-            for action in allowed_actions[last_face]:
-                face = action % 6
-
-                # Generate child state directly
-                child_state = state[perms[action]]
-
-                if np.array_equal(child_state, solved):
-                    return reconstruct_path(node_id) + [action], depth + 1
-
-                key = (child_state.tobytes(), face)
-
-                if score_children:
-                    child_one_hot = one_hot_table[child_state].ravel()
-                    score = heuristic(net, child_one_hot)
-                else:
-                    score = float(parent_q[i, action])
-
-                old = candidates.get(key)
-
-                if old is None or score < old[1]:
-                    candidates[key] = (
-                        child_state,
-                        score,
-                        node_id,
-                        action,
-                        face
-                    )
-
-        if not candidates:
+        if B == 0:
             break
 
-        # Select the best candidates
-        selected = heapq.nsmallest(
-            beam_width,
-            candidates.values(),
-            key=lambda x: x[1]
+        children = beam_states[:, PERMS_GPU]
+
+        # Determine valid actions for each parent
+        valid_mask = ALLOWED_MASK_GPU[
+            beam_last_faces + 1
+            ]
+
+        # Flatten children
+        children = children.reshape(-1, 54)
+
+        valid_flat = valid_mask.reshape(-1)
+
+        # Keep only valid children
+        children = children[valid_flat]
+
+        # Corresponding parent indices and actions
+        parent_indices = torch.arange(
+            B,
+            device=DEVICE
+        ).unsqueeze(1).expand(B, 18).reshape(-1)
+
+        actions = torch.arange(
+            18,
+            device=DEVICE
+        ).unsqueeze(0).expand(B, 18).reshape(-1)
+
+        parent_indices = parent_indices[valid_flat]
+        actions = actions[valid_flat]
+
+        faces = actions % 6
+
+        solved_mask = (
+                children == SOLVED_GPU
+        ).all(dim=1)
+
+        solved_indices = torch.nonzero(
+            solved_mask,
+            as_tuple=False
+        ).flatten()
+
+        if len(solved_indices) > 0:
+            idx = int(solved_indices[0].item())
+
+            parent_idx = int(parent_indices[idx].item())
+            action = int(actions[idx].item())
+
+            node_id = int(beam_node_ids[parent_idx])
+
+            return (
+                reconstruct_path(node_id) + [action],
+                depth + 1
+            )
+
+        if score_children:
+
+            # Evaluate resulting child states
+            scores = evaluate_children(
+                net,
+                children,
+                batch_size=inference_batch_size
+            )
+
+        else:
+
+            # Evaluate parent states
+            parent_q = evaluate_parents(
+                net,
+                beam_states
+            )
+
+            # Score each action using its parent's Q-values
+            scores = parent_q[
+                parent_indices,
+                actions
+            ]
+
+        keys = torch.cat(
+            [
+                children,
+                faces.to(torch.uint8).unsqueeze(1)
+            ],
+            dim=1
         )
 
-        new_beam = []
+        unique_keys, inverse = torch.unique(
+            keys,
+            dim=0,
+            return_inverse=True
+        )
 
-        for state, score, parent_id, action, face in selected:
+        n_unique = len(unique_keys)
+        n_candidates = len(scores)
 
-            node_id = next_id
-            next_id += 1
+        # Minimum score for each unique state
+        unique_scores = torch.full(
+            (n_unique,),
+            float("inf"),
+            dtype=scores.dtype,
+            device=DEVICE
+        )
 
-            parent_ids[node_id] = parent_id
-            parent_actions[node_id] = action
+        unique_scores.scatter_reduce_(
+            0,
+            inverse,
+            scores,
+            reduce="amin",
+            include_self=True
+        )
 
-            new_beam.append((state, node_id, face))
+        # Find the candidate index that produced the
+        # minimum score for each unique state.
+        candidate_indices = torch.arange(
+            n_candidates,
+            dtype=torch.long,
+            device=DEVICE
+        )
 
-        beam = new_beam
+        matching_indices = torch.where(
+            scores == unique_scores[inverse],
+            candidate_indices,
+            n_candidates
+        )
+
+        best_candidate = torch.full(
+            (n_unique,),
+            n_candidates,
+            dtype=torch.long,
+            device=DEVICE
+        )
+
+        best_candidate.scatter_reduce_(
+            0,
+            inverse,
+            matching_indices,
+            reduce="amin",
+            include_self=True
+        )
+
+        k = min(beam_width, n_unique)
+
+        selected_scores, selected_groups = torch.topk(
+            unique_scores,
+            k=k,
+            largest=False,
+            sorted=True
+        )
+
+        selected_indices = best_candidate[selected_groups]
+
+        # Select corresponding child states
+        new_beam_states = children[selected_indices]
+
+        new_beam_faces = faces[selected_indices]
+
+        selected_parent_indices = (
+            parent_indices[selected_indices]
+            .cpu()
+            .numpy()
+        )
+
+        selected_actions = (
+            actions[selected_indices]
+            .cpu()
+            .numpy()
+        )
+
+        new_beam_node_ids = np.arange(
+            next_id,
+            next_id + k,
+            dtype=np.int32
+        )
+
+        for i in range(k):
+            node_id = next_id + i
+
+            parent_idx = selected_parent_indices[i]
+
+            parent_ids[node_id] = beam_node_ids[parent_idx]
+
+            parent_actions[node_id] = selected_actions[i]
+
+        next_id += k
+
+        beam_states = new_beam_states
+
+        beam_last_faces = new_beam_faces
+
+        beam_node_ids = new_beam_node_ids
 
     return None
 
@@ -484,12 +717,13 @@ def beam_search(net, cube, beam_width=1 << 14,
 if __name__ == "__main__":
     # train()
     net = load_net("qnet_best.pt")
+    net.to(DEVICE)
     report(net)
 
     t0 = time.time()
     lengths = []
     logger = MoveLogger("solution.jsonl", False)
-    n = 1000
+    n = 100
     benchmark_rng = np.random.default_rng(42)
 
     scrambles = [
@@ -497,7 +731,7 @@ if __name__ == "__main__":
         for _ in range(n)
     ]
     for cube, scramble in scrambles:
-        result = beam_search(net, cube, beam_width=1 << 16)
+        result = beam_search(net, cube, beam_width=1 << 17)
         if result:
             solution, length = result
             print("Found solution of length:", length)
@@ -523,3 +757,6 @@ if __name__ == "__main__":
     with open("benchmark_results.txt", "a", encoding="utf-8") as f:
         f.write(stats)
 
+    # Time: 563.07s | Average length: 20.70 | Success: 10/10 (100.0%)
+
+    # Time: 328.35s | Average length: 20.70 | Success: 10/10 (100.0%)
